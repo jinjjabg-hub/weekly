@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>위클리 순서 바꾸기</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#6b7280; --line:#d6dae1; --accent:#c8102e; --ok:#11734b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --card:#1e2127; --text:#e8eaee; --muted:#9aa1ad; --line:#363b44; --accent:#ff4d5e; --ok:#4cc38a; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 -apple-system, "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+  main { max-width:560px; margin:40px auto; padding:0 16px; }
+  h1 { font-size:22px; margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; }
+  label { display:block; font-weight:600; margin:0 0 6px; }
+  input[type=file] { width:100%; margin-bottom:18px; color:var(--text); }
+  textarea { width:100%; height:240px; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); font:inherit; resize:vertical; }
+  button { width:100%; margin-top:16px; padding:14px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; font-weight:700; font-size:17px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  #msg { margin-top:14px; white-space:pre-line; color:var(--ok); }
+  #warn { margin-top:8px; white-space:pre-line; color:var(--accent); font-weight:700; }
+</style>
+</head>
+<body>
+<main>
+  <h1>위클리 발표 순서 바꾸기</h1>
+  <div class="card">
+    <label for="file">1. 주간회의 PPT 파일</label>
+    <input id="file" type="file" accept=".pptx">
+    <label for="list">2. 발표 순서 명단 (붙여넣기)</label>
+    <textarea id="list" placeholder="1. 정래권 대표님&#10;2. 박성진&#10;3. 김민수 대표"></textarea>
+    <button id="run">순서 바꿔서 다운로드</button>
+    <div id="msg"></div>
+    <div id="warn"></div>
+  </div>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+const SECTION_NAME = '위클리 장표 띄우기';
+// 이름처럼 보여도 사람이 아닌 단어
+const STOP = new Set(('대표 대표님 순서 이름 성명 업종 번호 비고 발표 발표자 명단 회사 연락처 전화 직함 멤버 챕터 ' +
+  '비지터 위클리 표지 소개 환영 감사 오프닝 휴식 공지 상생 상생업종 회장 부회장 리퍼럴 추천 교육 마무리 목차 안내 ' +
+  '자이언츠 파이오니어 게스트 방문자 오늘 다음 주간 회의 발표순서').split(' '));
+const VISITOR = /비지터|visitor|게스트|guest|방문자/i;
+const NAME = /^[가-힣]{2,4}$/;
+
+const $ = id => document.getElementById(id);
+const decode = s => s.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,'&');
+const stripTitle = s => s.replace(/대표님|대표|님/g, '');
+const isName = s => NAME.test(s) && !STOP.has(s);
+
+// 슬라이드 XML → 도형별 텍스트 배열
+function shapeTexts(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  const out = [];
+  for (const body of doc.getElementsByTagName('*')) {
+    if (body.localName !== 'txBody') continue;
+    const paras = [];
+    for (const p of body.getElementsByTagName('*')) {
+      if (p.localName !== 'p') continue;
+      let t = '';
+      for (const r of p.getElementsByTagName('*')) if (r.localName === 't') t += r.textContent;
+      paras.push(t);
+    }
+    const text = paras.join('\n').trim();
+    if (text) out.push(text);
+  }
+  return out;
+}
+
+// 도형 텍스트에서 발표자 이름 후보 ("이름[업종]" 또는 이름만 적힌 도형)
+function deckNames(texts) {
+  const names = [];
+  for (const t of texts) {
+    if (t.includes('상생')) continue;
+    for (const m of t.matchAll(/([가-힣]+)\s*(?:대표님|대표)?\s*\[([^\]]*)\]/g)) {
+      let n = stripTitle(m[1]);
+      if (n.length > 4) n = n.slice(-3);
+      if (isName(n)) names.push(n);
+    }
+    const whole = stripTitle(t.replace(/\s+/g, ''));
+    if (isName(whole)) names.push(whole);
+  }
+  return names;
+}
+
+// 명단 → 이름 배열 (번호, 직함, 엑셀 열이 섞여도 이름만)
+// strong: 장표에서 이름으로 찾은 것, inBody: 장표 본문에 들어 있는지
+function parseRoster(text, strong, inBody) {
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    const clean = stripTitle(line.replace(/\[[^\]]*\]|\([^)]*\)/g, ' '));
+    const cands = (clean.match(/[가-힣]+/g) || []).filter(isName);
+    if (!cands.length) continue;
+    const hits = cands.filter(c => strong.has(c));
+    const pick = hits.length ? hits : [cands.find(inBody) || cands[0]];
+    for (const n of pick) if (!out.includes(n)) out.push(n);
+  }
+  return out;
+}
+
+function setShow(xml, hide) {
+  return xml.replace(/<p:sld\b[^>]*>/, tag => {
+    tag = tag.replace(/\s+show="[^"]*"/, '');
+    return hide ? tag.replace(/<p:sld\b/, '<p:sld show="0"') : tag;
+  });
+}
+
+async function run() {
+  $('msg').textContent = ''; $('warn').textContent = '';
+  const file = $('file').files[0];
+  if (!file) throw new Error('PPT 파일을 먼저 올려주세요.');
+  if (!$('list').value.trim()) throw new Error('발표 순서 명단을 붙여넣어 주세요.');
+
+  const zip = await JSZip.loadAsync(file);
+  let pres = await zip.file('ppt/presentation.xml').async('string');
+  const rels = await zip.file('ppt/_rels/presentation.xml.rels').async('string');
+  const target = {};
+  for (const m of rels.matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = /\bId="([^"]+)"/.exec(m[0]), tg = /\bTarget="([^"]+)"/.exec(m[0]);
+    if (id && tg) target[id[1]] = tg[1].startsWith('/') ? tg[1].slice(1) : 'ppt/' + tg[1];
+  }
+
+  // 전체 슬라이드 목록 (p:sldIdLst)
+  const mainM = /<p:sldIdLst>([\s\S]*?)<\/p:sldIdLst>/.exec(pres);
+  if (!mainM) throw new Error('슬라이드 목록을 찾지 못했습니다. 올바른 pptx인지 확인해주세요.');
+  const entries = [...mainM[1].matchAll(/<p:sldId\b[^>]*?(?:\/>|>[\s\S]*?<\/p:sldId>)/g)].map(m => m[0]);
+  const slide = {};  // id → {raw, path}
+  for (const raw of entries) {
+    const id = /\bid="(\d+)"/.exec(raw)[1], rid = /\br:id="([^"]+)"/.exec(raw)[1];
+    slide[id] = { raw, path: target[rid] };
+  }
+
+  // 구역 (p14:section)
+  const sections = [...pres.matchAll(/<(\w+):section\b([^>]*)>([\s\S]*?)<\/\1:section>/g)].map(m => ({
+    full: m[0], index: m.index, prefix: m[1],
+    name: decode((/\bname="([^"]*)"/.exec(m[2]) || [, ''])[1]),
+    ids: [...m[3].matchAll(/<\w+:sldId\b[^>]*\bid="(\d+)"/g)].map(x => x[1]),
+  }));
+  if (!sections.length) throw new Error('이 PPT에는 구역(섹션)이 없습니다.');
+
+  const texts = {};
+  const readTexts = async id => texts[id] ??= shapeTexts(await zip.file(slide[id].path).async('string'));
+  let sec = sections.find(s => s.name.replace(/\s+/g, '') === SECTION_NAME.replace(/\s+/g, ''));
+  if (!sec) {
+    let best = -1;
+    for (const s of sections) {
+      let n = 0;
+      for (const id of s.ids) if ((await readTexts(id)).some(t => /weekly\s*presentation/i.test(t))) n++;
+      if (n > best) { best = n; sec = s; }
+    }
+    if (best <= 0) throw new Error(`"${SECTION_NAME}" 구역을 찾지 못했습니다.`);
+  }
+
+  // 구역 안 슬라이드별 이름 후보
+  const info = [];
+  const known = new Set();
+  for (const id of sec.ids) {
+    const t = await readTexts(id);
+    const names = deckNames(t);
+    names.forEach(n => known.add(n));
+    info.push({ id, texts: t, names });
+  }
+  const bodyText = id => info.find(x => x.id === id).texts.filter(t => !t.includes('상생')).join('\n');
+  const allBody = info.map(x => bodyText(x.id)).join('\n');
+
+  const roster = parseRoster($('list').value, known, n => allBody.includes(n));
+  if (!roster.length) throw new Error('명단에서 이름을 찾지 못했습니다.');
+
+  // 슬라이드 → 묶음(발표자 / 고정)
+  const groups = [];
+  let cur = null;
+  for (const x of info) {
+    let name = x.names.find(n => roster.includes(n)) || x.names[0];
+    if (!name) { const body = bodyText(x.id); name = roster.find(n => body.includes(n)); }
+    const visitor = (!name || !roster.includes(name)) && x.texts.some(t => VISITOR.test(t));
+    if (visitor) { cur = { fixed: true, ids: [x.id] }; groups.push(cur); }
+    else if (name) {
+      if (cur && !cur.fixed && cur.name === name) cur.ids.push(x.id);
+      else { cur = { name, ids: [x.id] }; groups.push(cur); }
+    } else if (cur) cur.ids.push(x.id);
+    else { cur = { fixed: true, ids: [x.id] }; groups.push(cur); }
+  }
+
+  // 새 순서: 고정 장표는 제자리, 나머지 자리에 명단 순 → 명단 밖(숨김) 순
+  const movable = groups.filter(g => !g.fixed);
+  const order = [];
+  for (const n of roster) movable.filter(g => g.name === n).forEach(g => order.push(...g.ids));
+  const hidden = movable.filter(g => !roster.includes(g.name));
+  hidden.forEach(g => order.push(...g.ids));
+  const fixedIds = new Set(groups.filter(g => g.fixed).flatMap(g => g.ids));
+  let k = 0;
+  const newSec = sec.ids.map(id => fixedIds.has(id) ? id : order[k++]);
+
+  // 숨김 처리
+  const hideIds = new Set(hidden.flatMap(g => g.ids));
+  for (const id of order) {
+    const path = slide[id].path;
+    const xml = await zip.file(path).async('string');
+    const next = setShow(xml, hideIds.has(id));
+    if (next !== xml) zip.file(path, next);
+  }
+
+  // p:sldIdLst + p14:sldIdLst 둘 다 같은 순서로 갱신
+  const secSet = new Set(sec.ids);
+  const allIds = entries.map(raw => /\bid="(\d+)"/.exec(raw)[1]);
+  let j = 0;
+  const newAll = allIds.map(id => secSet.has(id) ? newSec[j++] : id);
+  const p = sec.prefix;
+  const newSecXml = sec.full.replace(/<(\w+):sldIdLst\s*\/>|<(\w+):sldIdLst>[\s\S]*?<\/\2:sldIdLst>/,
+    `<${p}:sldIdLst>${newSec.map(id => `<${p}:sldId id="${id}"/>`).join('')}</${p}:sldIdLst>`);
+  pres = pres.slice(0, sec.index) + newSecXml + pres.slice(sec.index + sec.full.length);
+  pres = pres.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, `<p:sldIdLst>${newAll.map(id => slide[id].raw).join('')}</p:sldIdLst>`);
+  zip.file('ppt/presentation.xml', pres);
+
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE',
+    mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${ymd}_주간회의_순서적용.pptx`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+
+  const found = new Set(movable.map(g => g.name));
+  const missing = roster.filter(n => !found.has(n));
+  $('msg').textContent = `완료: ${roster.length - missing.length}명 순서 적용` +
+    (hidden.length ? `, 명단에 없는 ${hidden.length}명(${hidden.map(g => g.name).join(', ')})은 맨 뒤로 보내고 숨김` : '');
+  if (missing.length) $('warn').textContent = `⚠ 장표를 못 찾은 이름: ${missing.join(', ')}\n(PPT에서 이름 철자를 확인하거나 직접 옮겨주세요)`;
+}
+
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  try { await run(); }
+  catch (e) { $('warn').textContent = '⚠ ' + e.message; console.error(e); }
+  finally { $('run').disabled = false; }
+});
+</script>
+</body>
+</html>
